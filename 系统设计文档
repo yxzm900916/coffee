@@ -1,0 +1,1695 @@
+# 咖记 CoffeeNote — 一期系统设计文档
+
+> **版本**：v1.0 | **阶段**：Phase 1 MVP（0-3 个月）
+> **基线文档**：《一期产品 PRD v1.0》《产品设计方案》
+
+---
+
+## 一、项目概述
+
+### 1.1 项目背景与一期目标
+
+咖记 CoffeeNote 是一款面向咖啡爱好者的记录与发现工具。一期聚焦核心闭环：**记录 → AI 卡通卡片生成 → 收藏回顾 → 基础统计**。
+
+一期范围与成功指标详见 PRD 第 1.1-1.3 节，此处不重复。
+
+### 1.2 文档范围与读者
+
+本文档面向开发团队（前端、后端、AI 工程师、运维），将 PRD 中的产品需求转化为可落地的技术实现方案，涵盖系统架构、模块设计、数据库、API、AI 集成、缓存、安全、部署等全部内容。
+
+### 1.3 术语表
+
+| 术语 | 说明 |
+|------|------|
+| card_source | 卡片图片来源：`pre_generated`（预生成库命中）、`realtime`（实时生成）、`fallback`（兜底图）|
+| card_status | 卡片生成状态：`pending` → `matched` / `generating` → `generated` / `failed` |
+| pre_generated | 基于品牌+品类组合提前批量生成的卡通形象图，用户记录时直接匹配返回 |
+| coffee_category | 咖啡品类枚举值（americano / latte / pour_over 等，完整枚举见 PRD 4.2）|
+| scene_type | 首页场景文案类型（weekday_morning / weekend_afternoon 等 10 种组合）|
+| card_template | 预生成卡片库中的模板记录，存储品牌+品类到卡通图的映射 |
+
+---
+
+## 二、系统架构总览
+
+### 2.1 整体架构
+
+```
+┌──────────────────────────────────────────────────────────────────┐
+│                          客户端层                                │
+│                                                                  │
+│   ┌─────────────────┐          ┌─────────────────┐              │
+│   │  Flutter App     │          │  Next.js H5     │              │
+│   │  (iOS/Android)   │          │  (Web 浏览器)    │              │
+│   │                  │          │                  │              │
+│   │  - 记录/拍照     │          │  - 卡片分享落地页 │              │
+│   │  - 卡片册        │          │  - 轻量 Web 卡片册│              │
+│   │  - 统计          │          │  - SSR/SSG 渲染  │              │
+│   │  - 首页          │          │                  │              │
+│   └────────┬────────┘          └────────┬────────┘              │
+│            │                             │                       │
+└────────────┼─────────────────────────────┼───────────────────────┘
+             │                             │
+             ▼                             ▼
+┌──────────────────────────────────────────────────────────────────┐
+│                       NestJS API 层                              │
+│                                                                  │
+│   ┌─────────┐ ┌──────────┐ ┌──────────┐ ┌──────────┐           │
+│   │ Auth    │ │ Record   │ │ Card     │ │ Stats    │           │
+│   │ Module  │ │ Module   │ │ Module   │ │ Module   │           │
+│   └─────────┘ └──────────┘ └──────────┘ └──────────┘           │
+│   ┌─────────┐ ┌──────────┐ ┌──────────┐                        │
+│   │ Shop    │ │ Home     │ │ Upload   │                        │
+│   │ Module  │ │ Module   │ │ Module   │                        │
+│   └─────────┘ └──────────┘ └──────────┘                        │
+└───────────────────────────┬──────────────────────────────────────┘
+                            │
+             ┌──────────────┼──────────────────┐
+             ▼              ▼                  ▼
+┌──────────────────┐ ┌───────────────┐ ┌──────────────────┐
+│   数据存储层      │ │   缓存/队列层  │ │   文件存储层      │
+│                  │ │               │ │                  │
+│  PostgreSQL 16   │ │   Redis 7     │ │   MinIO          │
+│  + PostGIS       │ │               │ │   (S3 兼容)      │
+│                  │ │  - 会话缓存    │ │                  │
+│  - 主业务数据     │ │  - 卡片匹配缓存 │ │  - 用户照片      │
+│  - 地理检索      │ │  - 统计缓存    │ │  - 卡通卡片图    │
+│  - 店铺库        │ │  - Streams    │ │  - 缩略图        │
+│                  │ │    消息队列    │ │                  │
+└──────────────────┘ └───────────────┘ └──────────────────┘
+
+             ┌──────────────────────────────────┐
+             │          外部云服务层              │
+             │                                  │
+             │  阿里云 Qwen-VL API（图片识别）    │
+             │  阿里云/第三方 AI API（卡片生成）   │
+             │  高德 API（POI/地理编码/周边搜索）  │
+             │  微信开放平台（登录/分享）          │
+             │  短信服务（验证码）                │
+             └──────────────────────────────────┘
+```
+
+### 2.2 技术选型决策表
+
+技术栈原则：**基础设施开源自建，AI 和地图走云服务 API**。
+
+| 层 | 选型 | 版本 | 说明 |
+|---|------|------|------|
+| 移动端 App | Flutter（Dart） | 3.x | 跨平台 iOS 14+ / Android 8.0+，相机 API 成熟，动画性能优 |
+| H5 Web | Next.js（React/TypeScript） | 14.x | 卡片分享落地页 + 轻量 Web 版，App Router + SSR/SSG |
+| 后端 API | NestJS（TypeScript） | 10.x | 模块化架构，与 H5 共享 TypeScript 类型定义 |
+| 数据库 | PostgreSQL + PostGIS | 16.x | 主数据存储 + 地理空间检索 |
+| ORM | TypeORM | 0.3.x | NestJS 原生集成，Migration 支持 |
+| 缓存 | Redis | 7.x | 会话管理、卡片匹配缓存、统计缓存、Streams 消息队列 |
+| 对象存储 | MinIO | 最新稳定版 | S3 兼容 API，自建部署，存储照片和卡片图片 |
+| AI 图片识别 | 阿里云 Qwen-VL API | - | 多图片合并解析，识别咖啡品类/品牌/豆子/风味 |
+| AI 卡片生成 | 阿里云通义万相 / 即梦 API | - | 卡通形象图生成，预生成库 + 实时生成双模式 |
+| 地图/地理 | 高德 API | - | POI 搜索、地理编码、逆地理编码、周边搜索 |
+| 部署 | Docker Compose | v2 | 单机多容器部署，开发/测试/生产统一 |
+
+### 2.3 部署拓扑
+
+```
+┌─────────────────────────────────────────────────┐
+│              Docker Compose 集群                  │
+│                                                  │
+│  ┌──────────┐  ┌──────────┐  ┌──────────┐      │
+│  │ NestJS   │  │ Next.js  │  │ Nginx    │      │
+│  │ API      │  │ H5       │  │ (反向代理) │      │
+│  │ :3000    │  │ :3001    │  │ :80/443  │      │
+│  └──────────┘  └──────────┘  └──────────┘      │
+│                                                  │
+│  ┌──────────┐  ┌──────────┐  ┌──────────┐      │
+│  │PostgreSQL│  │  Redis   │  │  MinIO   │      │
+│  │  :5432   │  │  :6379   │  │  :9000   │      │
+│  └──────────┘  └──────────┘  └──────────┘      │
+│                                                  │
+└─────────────────────────────────────────────────┘
+              │
+              │ HTTPS
+              ▼
+    ┌───────────────────┐
+    │   外部云服务       │
+    │  Qwen-VL / 通义万相 │
+    │  高德 API / 微信    │
+    └───────────────────┘
+```
+
+Nginx 作为反向代理，根据路由分发：
+- `/api/*` → NestJS API（:3000）
+- `/*`（其他） → Next.js H5（:3001）
+
+### 2.4 环境规划
+
+| 环境 | 用途 | 配置差异 |
+|------|------|----------|
+| dev | 本地开发 | docker-compose.dev.yml，AI Mock 模式，热重载 |
+| staging | 测试/预发布 | 连接真实 AI API，测试数据库 |
+| production | 线上生产 | 正式 AI API Key，生产数据库，CDN 加速 |
+
+### 2.5 本地开发环境搭建
+
+**一键启动命令**：
+
+```bash
+# 1. 启动全部基础设施
+docker-compose -f docker-compose.dev.yml up -d
+
+# 2. 初始化数据库 + 种子数据
+npm run db:migrate      # 执行 Migration
+npm run db:seed         # 导入种子数据（品牌店铺 + 预生成卡片库）
+
+# 3. 启动后端 API（热重载）
+cd apps/api && npm run start:dev
+
+# 4. 启动 H5 Web（热重载）
+cd apps/h5 && npm run dev
+
+# 5. Flutter App
+flutter run             # 连接模拟器/真机
+```
+
+**docker-compose.dev.yml 包含的服务**：
+
+| 服务 | 镜像 | 端口 | 说明 |
+|------|------|------|------|
+| postgres | postgis/postgis:16-3.4 | 5432 | PostgreSQL + PostGIS |
+| redis | redis:7-alpine | 6379 | 缓存 + 消息队列 |
+| minio | minio/minio:latest | 9000/9001 | 对象存储（API/控制台） |
+
+**AI 服务 Mock 模式**：
+
+开发环境通过环境变量 `AI_MOCK=true` 开启 Mock 模式：
+- 图片识别接口：跳过 Qwen-VL 调用，返回固定识别结果（拿铁 + Manner + 置信度 0.9）
+- 卡片生成接口：跳过 AI 生图，返回预置的本地测试图片
+- 目的：避免开发时频繁调用云服务 API（节省成本 + 加速开发循环）
+
+**种子数据**：
+
+- 品牌店铺种子：8 个连锁品牌（星巴克/瑞幸/Manner/M Stand/%Arabica/Seesaw/Peet's/Tims）的门店数据，含 GPS 坐标
+- 预生成卡片库种子：8 品牌 × 14 品类 = 112 张预生成卡通形象图（开发阶段使用占位图）
+
+
+---
+
+## 三、模块划分与职责
+
+### 3.1 项目仓库结构
+
+采用 Monorepo 结构，统一管理三端代码：
+
+```
+coffeenote/
+├── apps/
+│   ├── api/                  # NestJS 后端 API
+│   ├── h5/                   # Next.js H5 Web
+│   └── mobile/               # Flutter App
+├── packages/
+│   └── shared-types/         # 共享 TypeScript 类型定义
+├── docker-compose.yml        # 生产部署
+├── docker-compose.dev.yml    # 开发环境
+├── package.json              # Monorepo 根配置（pnpm workspaces）
+└── pnpm-workspace.yaml
+```
+
+### 3.2 Flutter App 模块划分
+
+```
+apps/mobile/lib/
+├── core/                     # 核心基础层
+│   ├── network/              # HTTP 客户端（Dio 封装、拦截器、Token 管理）
+│   ├── storage/              # 本地存储（SQLite、SharedPreferences）
+│   ├── di/                   # 依赖注入（get_it / riverpod）
+│   └── utils/                # 工具函数
+├── features/
+│   ├── auth/                 # 登录/注册（微信 + 手机号）
+│   │   ├── data/             # Repository、Remote DataSource
+│   │   ├── domain/           # Entity、UseCase
+│   │   └── presentation/     # Page、Widget、Bloc/Cubit
+│   ├── record/               # 咖啡记录（拍照 + 手动输入）
+│   │   ├── data/
+│   │   ├── domain/
+│   │   └── presentation/     # 拍照页（多图）、表单页
+│   ├── card/                 # 卡片生成与预览
+│   │   ├── data/
+│   │   ├── domain/
+│   │   └── presentation/     # 卡片预览页、重新生成
+│   ├── album/                # 卡片册（卡片墙 + 日历视图）
+│   │   ├── data/
+│   │   ├── domain/
+│   │   └── presentation/     # 卡片墙页、日历页、卡片详情页
+│   ├── stats/                # 统计（总览 + 排行 + 惊喜发现）
+│   │   ├── data/
+│   │   ├── domain/
+│   │   └── presentation/     # 统计页
+│   ├── home/                 # 首页（今日卡片 + 咖啡生活流）
+│   │   ├── data/
+│   │   ├── domain/
+│   │   └── presentation/     # 首页、场景文案组件
+│   ├── shop/                 # 店铺搜索与选择
+│   │   ├── data/
+│   │   ├── domain/
+│   │   └── presentation/     # 搜索页、附近列表
+│   └── settings/             # 设置页
+│       └── presentation/
+├── shared/                   # 跨 Feature 共享组件
+│   ├── widgets/              # 通用 UI 组件（悬浮按钮、加载动画等）
+│   ├── models/               # 共享数据模型
+│   └── theme/                # 主题配置
+└── main.dart                 # App 入口
+```
+
+### 3.3 Next.js H5 模块划分
+
+```
+apps/h5/
+├── app/                      # App Router（Next.js 14）
+│   ├── share/
+│   │   └── [recordId]/
+│   │       └── page.tsx      # 卡片分享落地页（SSR）
+│   ├── album/
+│   │   └── page.tsx          # 轻量 Web 卡片册（SSR + 客户端交互）
+│   ├── record/
+│   │   └── [id]/
+│   │       └── page.tsx      # 记录详情页
+│   ├── layout.tsx            # 根布局
+│   └── page.tsx              # 首页（引导下载 App）
+├── components/
+│   ├── share-card/           # 分享卡片组件（OG 图片生成）
+│   ├── card-wall/            # 卡片墙组件（瀑布流）
+│   └── common/               # 通用组件
+├── lib/
+│   ├── api-client.ts         # API 请求封装
+│   └── og-image.ts           # Open Graph 图片动态生成
+├── public/                   # 静态资源
+└── next.config.js
+```
+
+**H5 页面职责**：
+
+| 页面 | 路由 | 渲染方式 | 说明 |
+|------|------|----------|------|
+| 卡片分享落地页 | /share/[recordId] | SSR | 展示单张卡片大图 + 记录信息 + "下载 App" CTA，OG Meta 标签 |
+| Web 卡片册 | /album | SSR + Client | 用户登录后可浏览卡片墙（需 JWT 认证）|
+| 记录详情页 | /record/[id] | SSR | 单条记录完整信息 |
+| 首页 | / | SSG | 产品介绍 + 下载引导 |
+
+### 3.4 NestJS 后端模块划分
+
+```
+apps/api/src/
+├── modules/
+│   ├── auth/                 # 认证鉴权
+│   │   ├── auth.controller.ts
+│   │   ├── auth.service.ts
+│   │   ├── strategies/       # JWT Strategy、WeChat Strategy
+│   │   ├── guards/           # JwtAuthGuard
+│   │   └── dto/
+│   ├── record/               # 咖啡记录 CRUD
+│   │   ├── record.controller.ts
+│   │   ├── record.service.ts
+│   │   ├── entities/         # TypeORM Entity
+│   │   └── dto/
+│   ├── card/                 # 卡片匹配与生成
+│   │   ├── card.controller.ts
+│   │   ├── card.service.ts
+│   │   ├── card-generator.service.ts  # AI 生图封装
+│   │   └── entities/
+│   ├── shop/                 # 店铺库
+│   │   ├── shop.controller.ts
+│   │   ├── shop.service.ts
+│   │   ├── gaode.service.ts  # 高德 API 封装
+│   │   └── entities/
+│   ├── stats/                # 统计
+│   │   ├── stats.controller.ts
+│   │   ├── stats.service.ts
+│   │   └── dto/
+│   ├── home/                 # 首页 Feed
+│   │   ├── home.controller.ts
+│   │   ├── home.service.ts
+│   │   └── dto/
+│   ├── upload/               # 文件上传
+│   │   ├── upload.controller.ts
+│   │   ├── upload.service.ts
+│   │   └── minio.service.ts  # MinIO 封装
+│   └── user/                 # 用户资料
+│       ├── user.controller.ts
+│       ├── user.service.ts
+│       └── entities/
+├── common/                   # 公共模块
+│   ├── filters/              # 全局异常过滤器
+│   ├── interceptors/         # 响应格式拦截器
+│   ├── pipes/                # 参数校验管道
+│   └── decorators/           # 自定义装饰器
+├── config/                   # 配置管理
+│   ├── database.config.ts
+│   ├── redis.config.ts
+│   ├── minio.config.ts
+│   └── ai.config.ts
+└── main.ts                   # 应用入口
+```
+
+**后端模块职责矩阵**：
+
+| 模块 | 核心职责 | 依赖模块 | 外部依赖 |
+|------|----------|----------|----------|
+| auth | 微信登录、手机号登录、JWT 签发/刷新 | user | 微信开放平台、短信服务 |
+| record | 记录 CRUD、日历数据、多图 AI 识别 | card, upload, shop | 阿里云 Qwen-VL API |
+| card | 卡片匹配（预生成优先）、实时生成、状态轮询 | record, upload | 阿里云通义万相/即梦 API |
+| shop | 店铺搜索、GPS 匹配、自定义店铺创建 | - | 高德 API |
+| stats | 统计概览、排行（品类/店铺/品牌）、惊喜发现 | record | - |
+| home | 首页 Feed 聚合（场景文案 + 今日卡片 + 展位） | record, stats, shop | - |
+| upload | 文件上传至 MinIO、预签名 URL 生成 | - | MinIO |
+| user | 用户资料管理、咖啡身份标签 | - | - |
+
+### 3.5 前后端类型共享方案
+
+`packages/shared-types` 包定义前后端共用的 TypeScript 类型：
+
+```typescript
+// packages/shared-types/src/index.ts
+
+// 咖啡记录
+export interface CoffeeRecord {
+  id: string;
+  userId: string;
+  shopId?: string;
+  shopName?: string;
+  shopBrand?: string;
+  coffeeCategory: CoffeeCategory;
+  beanOrigin?: string;
+  roastLevel?: RoastLevel;
+  processMethod?: ProcessMethod;
+  flavorTags: string[];
+  rating: number;
+  price?: number;
+  review?: string;
+  photoUrls: string[];
+  cardImageUrl?: string;
+  cardSource?: CardSource;
+  cardStatus: CardStatus;
+  recordDate: string;
+  createdAt: string;
+}
+
+// 枚举类型
+export type CoffeeCategory = 'americano' | 'latte' | 'cappuccino' | 'flat_white' | 'mocha' | 'macchiato' | 'dirty' | 'pour_over' | 'cold_brew' | 'ice_drip' | 'signature' | 'instant' | 'capsule' | 'other';
+export type CardSource = 'pre_generated' | 'realtime' | 'fallback';
+export type CardStatus = 'pending' | 'matched' | 'generating' | 'generated' | 'failed';
+export type RoastLevel = 'light' | 'medium_light' | 'medium' | 'medium_dark' | 'dark';
+export type SceneType = 'weekday_morning' | 'weekday_forenoon' | 'weekday_afternoon' | 'weekday_evening' | 'weekday_night' | 'weekend_morning' | 'weekend_forenoon' | 'weekend_afternoon' | 'weekend_evening' | 'weekend_night';
+
+// API 响应格式
+export interface ApiResponse<T> {
+  code: number;
+  msg: string;
+  data: T;
+}
+
+// 首页 Feed
+export interface HomeFeedData {
+  greeting: { sceneType: SceneType; hasRecordToday: boolean; text: string };
+  todayCards: CoffeeRecord[];
+  shopSlot: ShopSlot | null;
+  categorySlot: CategorySlot | null;
+  surpriseSlot: SurpriseSlot | null;
+}
+```
+
+**引用方式**：
+
+- NestJS（apps/api）：`import { CoffeeRecord, ApiResponse } from '@coffeenote/shared-types'`
+- Next.js（apps/h5）：`import { CoffeeRecord, HomeFeedData } from '@coffeenote/shared-types'`
+- Flutter App：手动维护对应的 Dart 数据模型（使用 freezed 或 json_serializable 生成）
+
+
+---
+
+## 四、核心流程时序设计
+
+### 4.1 用户注册/登录流程
+
+支持微信登录和手机号登录两种方式。
+
+```
+用户                    Flutter App              NestJS API              微信/短信服务
+ │                         │                        │                        │
+ │  选择登录方式            │                        │                        │
+ │────────────────────────>│                        │                        │
+ │                         │                        │                        │
+ │  [微信登录]              │                        │                        │
+ │                         │  wx.login() 获取 code   │                        │
+ │                         │───────────────────────>│                        │
+ │                         │                        │  POST /sns/jscode2session│
+ │                         │                        │───────────────────────>│
+ │                         │                        │<───── openid + session_key│
+ │                         │                        │                        │
+ │                         │                        │  查找或创建用户          │
+ │                         │                        │  生成 JWT Token 对       │
+ │                         │<──── accessToken + refreshToken ────────────────│
+ │                         │                        │                        │
+ │  [手机号登录]            │                        │                        │
+ │                         │  POST /auth/sms         │                        │
+ │                         │  {phone}               │                        │
+ │                         │───────────────────────>│  发送验证码             │
+ │                         │                        │───────────────────────>│
+ │                         │                        │                        │
+ │  输入验证码              │                        │                        │
+ │────────────────────────>│                        │                        │
+ │                         │  POST /auth/phone       │                        │
+ │                         │  {phone, code}         │                        │
+ │                         │───────────────────────>│  校验验证码             │
+ │                         │                        │  查找或创建用户          │
+ │                         │<──── accessToken + refreshToken ────────────────│
+```
+
+**JWT 双 Token 机制**：
+- accessToken：有效期 2 小时，存储于内存，每次请求携带
+- refreshToken：有效期 30 天，存储于安全存储（Flutter SecureStorage / HttpOnly Cookie），accessToken 过期时自动刷新
+- 刷新失败（refreshToken 过期）→ 跳转登录页
+
+### 4.2 拍照记录 + 多图 AI 识别流程
+
+```
+Flutter App              NestJS API              MinIO              阿里云 Qwen-VL          高德 API
+    │                        │                      │                    │                    │
+    │  拍照/选择照片（最多5张）│                      │                    │                    │
+    │  上传照片               │                      │                    │                    │
+    │  POST /upload (多图)    │                      │                    │                    │
+    │───────────────────────>│  存储至 MinIO         │                    │                    │
+    │                        │─────────────────────>│                    │                    │
+    │                        │<──── photoUrls[] ─────│                    │                    │
+    │                        │                      │                    │                    │
+    │  提交记录               │                      │                    │                    │
+    │  POST /records          │                      │                    │                    │
+    │  {photoUrls, gps}       │                      │                    │                    │
+    │───────────────────────>│                      │                    │                    │
+    │                        │  逆地理编码（GPS→地址） │                    │                    │
+    │                        │─────────────────────────────────────────────────────────────>│
+    │                        │<──── 地址信息 ────────────────────────────────────────────────│
+    │                        │                      │                    │                    │
+    │                        │  多图合并识别           │                    │                    │
+    │                        │  POST Qwen-VL API      │                    │                    │
+    │                        │  {images[], prompt}    │                    │                    │
+    │                        │───────────────────────────────────────────>│                    │
+    │                        │<──── 结构化识别结果 ─────────────────────────│                    │
+    │                        │  (品类/品牌/豆子/风味)  │                    │                    │
+    │                        │                      │                    │                    │
+    │                        │  预填结果返回           │                    │                    │
+    │<──── 识别结果 + 预填数据 │                      │                    │                    │
+    │                        │                      │                    │                    │
+    │  用户确认/修改表单       │                      │                    │                    │
+    │  PUT /records/{id}      │                      │                    │                    │
+    │───────────────────────>│  保存最终记录          │                    │                    │
+    │                        │  触发卡片匹配          │                    │                    │
+    │                        │  POST /cards/match    │                    │                    │
+    │                        │  (详见 4.4)           │                    │                    │
+```
+
+**降级策略**：
+- Qwen-VL 超时（>8 秒）：降级为仅解析第一张图片；若仍超时（>5 秒），跳过识别，返回空结果
+- Qwen-VL 调用失败：同上，跳过识别，前端提示"识别失败，请手动填写"
+- 部分图片上传失败：后端标记失败图片，继续用已上传图片识别
+
+### 4.3 手动输入记录流程
+
+```
+Flutter App              NestJS API              高德 API
+    │                        │                      │
+    │  进入手动输入表单        │                      │
+    │  GPS 定位               │                      │
+    │  请求附近店铺            │                      │
+    │  GET /shops/nearby      │                      │
+    │───────────────────────>│  高德周边搜索          │
+    │                        │─────────────────────>│
+    │                        │<──── 附近店铺列表 ─────│
+    │<──── 附近店铺列表       │                      │
+    │                        │                      │
+    │  用户选择店铺 + 填写表单 │                      │
+    │  POST /records          │                      │
+    │───────────────────────>│  保存记录             │
+    │                        │  触发卡片匹配         │
+    │<──── record + card_status ─────────────────────│
+```
+
+### 4.4 卡片匹配与生成流程
+
+这是系统中最复杂的异步流程，分为预生成命中和实时生成两条路径。
+
+```
+Flutter App              NestJS API              Redis               MinIO           通义万相 API
+    │                        │                    │                    │                 │
+    │  POST /cards/match      │                    │                    │                 │
+    │  {record_id, brand,     │                    │                    │                 │
+    │   coffee_category}      │                    │                    │                 │
+    │───────────────────────>│                    │                    │                 │
+    │                        │  查询预生成库缓存    │                    │                 │
+    │                        │  GET card:{brand}:{category}             │                 │
+    │                        │───────────────────>│                    │                 │
+    │                        │                    │                    │                 │
+    │                        │  [命中]             │                    │                 │
+    │                        │<──── card_template ─│                    │                 │
+    │                        │  更新 record.card_image_url              │                 │
+    │<──── {source: pre_generated, card_image_url} │                    │                 │
+    │                        │                    │                    │                 │
+    │                        │  [未命中]            │                    │                 │
+    │<──── {source: realtime, task_id, status: generating}              │                 │
+    │                        │                    │                    │                 │
+    │                        │  发布生成任务至 Redis Streams             │                 │
+    │                        │───────────────────>│                    │                 │
+    │                        │                    │                    │                 │
+    │  轮询卡片状态            │                    │                    │                 │
+    │  GET /cards/{id}/status │                    │                    │                 │
+    │  (每 2 秒)              │                    │                    │                 │
+    │───────────────────────>│                    │                    │                 │
+    │                        │                    │                    │                 │
+    │                        │  [Worker 消费任务]   │                    │                 │
+    │                        │  调用通义万相 API     │                    │                 │
+    │                        │─────────────────────────────────────────────────────────>│
+    │                        │<──── 生成图片 URL ─────────────────────────────────────────│
+    │                        │  上传图片至 MinIO     │                    │                 │
+    │                        │────────────────────────────────────────>│                 │
+    │                        │<──── image_url ─────────────────────────│                 │
+    │                        │  更新 record + 写入预生成库缓存           │                 │
+    │                        │───────────────────>│                    │                 │
+    │                        │                    │                    │                 │
+    │<──── {status: generated, card_image_url} ─────│                    │                 │
+```
+
+**轮询策略**：
+- 仅 realtime 场景需要轮询
+- 前端每 2 秒调用 `GET /cards/{record_id}/status`
+- 超时 30 秒后停止轮询，前端展示兜底图（card_source = fallback）
+- 预生成命中无需轮询，直接返回
+
+**实时生成失败重试**：
+- Worker 消费任务失败后自动重试 1 次
+- 二次失败后将 card_status 设为 `failed`，前端展示兜底图
+
+### 4.5 首页 Feed 加载流程
+
+```
+Flutter App              NestJS API              Redis               PostgreSQL
+    │                        │                    │                    │
+    │  GET /home/feed         │                    │                    │
+    │───────────────────────>│                    │                    │
+    │                        │                    │                    │
+    │                        │  1. 计算场景文案     │                    │
+    │                        │  (根据当前时间+星期) │                    │
+    │                        │                    │                    │
+    │                        │  2. 查询今日卡片     │                    │
+    │                        │  GET home:today:{userId}:{date}          │
+    │                        │───────────────────>│                    │
+    │                        │  [未命中]           │                    │
+    │                        │  SELECT * FROM coffee_records            │
+    │                        │  WHERE user_id=? AND DATE(record_date)=today
+    │                        │────────────────────────────────────────>│
+    │                        │<──── today_cards ───────────────────────│
+    │                        │  写入缓存（TTL 5 分钟）                   │
+    │                        │───────────────────>│                    │
+    │                        │                    │                    │
+    │                        │  3. 计算展位数据     │                    │
+    │                        │  (店铺/品类/惊喜)   │                    │
+    │                        │  SELECT 聚合查询     │                    │
+    │                        │────────────────────────────────────────>│
+    │                        │<──── 展位数据 ──────────────────────────│
+    │                        │                    │                    │
+    │                        │  组装 Feed 响应      │                    │
+    │<──── HomeFeedData ──────│                    │                    │
+```
+
+### 4.6 统计查询流程
+
+```
+Flutter App              NestJS API              Redis               PostgreSQL
+    │                        │                    │                    │
+    │  GET /stats/overview    │                    │                    │
+    │  ?period=month          │                    │                    │
+    │───────────────────────>│                    │                    │
+    │                        │  查询缓存            │                    │
+    │                        │  GET stats:{userId}:overview:{period}    │
+    │                        │───────────────────>│                    │
+    │                        │  [命中] 直接返回     │                    │
+    │                        │  [未命中]           │                    │
+    │                        │  聚合查询            │                    │
+    │                        │────────────────────────────────────────>│
+    │                        │<──── 统计结果 ──────────────────────────│
+    │                        │  写入缓存（TTL 1 小时）                   │
+    │<──── 统计数据 ──────────│                    │                    │
+```
+
+排行和惊喜发现接口同理，缓存 Key 分别为 `stats:{userId}:ranking:{type}:{period}` 和 `stats:{userId}:surprise`。
+
+**三维度切换**：period 参数可选 `history` / `year` / `month`，统计服务和排行服务均根据 period 动态计算时间范围。
+
+### 4.7 卡片分享流程
+
+```
+Flutter App              NestJS API              Next.js H5           微信/社交平台
+    │                        │                      │                    │
+    │  点击分享               │                      │                    │
+    │  生成分享链接            │                      │                    │
+    │  https://domain.com/    │                      │                    │
+    │  share/{recordId}       │                      │                    │
+    │                        │                      │                    │
+    │  调用系统分享            │                      │                    │
+    │─────────────────────────────────────────────────────────────────>│
+    │                        │                      │                    │
+    │                        │                      │                    │
+    │  [好友点击链接]          │                      │                    │
+    │                        │                      │                    │
+    │                        │                      │  GET /share/{id}   │
+    │                        │                      │  SSR 渲染           │
+    │                        │  GET /records/{id}    │                    │
+    │                        │<─────────────────────│                    │
+    │                        │  (公开接口，无需认证)  │                    │
+    │                        │─────────────────────>│                    │
+    │                        │                      │                    │
+    │                        │                      │  生成 OG Meta       │
+    │                        │                      │  (标题/描述/图片)   │
+    │                        │                      │                    │
+    │                        │                      │  返回 HTML          │
+    │                        │                      │───────────────────>│
+    │                        │                      │                    │
+```
+
+**分享落地页关键设计**：
+- SSR 渲染确保社交平台的爬虫能抓取到 OG Meta 标签（微信/微博预览卡片）
+- 页面包含：卡片大图 + 咖啡信息 + "下载咖记 App" CTA 按钮
+- App 已安装时支持 Deep Link 直接跳转到 App 内详情页
+
+### 4.8 离线记录与同步流程
+
+```
+Flutter App              本地 SQLite             NestJS API
+    │                        │                      │
+    │  [无网络状态]           │                      │
+    │  用户提交记录           │                      │
+    │───────────────────────>│                      │
+    │                        │  INSERT record        │
+    │                        │  status = 'pending'   │
+    │<──── 保存成功（本地）────│                      │
+    │                        │                      │
+    │  [网络恢复]             │                      │
+    │  检测网络状态变化        │                      │
+    │  查询待同步记录         │                      │
+    │───────────────────────>│                      │
+    │<──── pending records ───│                      │
+    │                        │                      │
+    │  批量上传               │                      │
+    │  POST /records (逐条)   │                      │
+    │──────────────────────────────────────────────>│
+    │                        │                      │  保存 + 触发卡片生成
+    │<──── 同步结果 ─────────────────────────────────│
+    │                        │                      │
+    │  更新本地状态            │                      │
+    │───────────────────────>│                      │
+    │                        │  UPDATE status = 'synced'
+```
+
+**冲突处理**：以服务端数据为准（Last Write Wins），本地同步时携带 `updated_at` 时间戳，服务端比对后决定是否覆盖。
+
+
+---
+
+## 五、数据库详细设计
+
+### 5.1 ER 关系图
+
+```
+┌──────────┐     1:N     ┌─────────────────┐     N:1     ┌──────────┐
+│  users   │────────────>│  coffee_records  │<────────────│  shops   │
+└──────────┘             └────────┬────────┘             └──────────┘
+                                  │                          
+                                  │ N:1 (card_image_url      
+                                  │  关联 card_templates)    
+                                  ▼                          
+                         ┌─────────────────┐                 
+                         │ card_templates  │                 
+                         └─────────────────┘                 
+                                                             
+┌──────────┐     1:N     ┌─────────────────┐                 
+│  users   │────────────>│ user_shops      │  (用户常用店铺)  
+└──────────┘             └─────────────────┘                 
+```
+
+核心关系：
+- users 1:N coffee_records（一个用户多条记录）
+- shops 1:N coffee_records（一个店铺多条记录，shop_id 可为 null）
+- card_templates 独立表（通过 brand + coffee_category 关联）
+- users 1:N user_shops（用户常用店铺缓存）
+
+### 5.2 完整表结构
+
+#### users（用户表）
+
+```sql
+CREATE TABLE users (
+    id              UUID PRIMARY KEY DEFAULT gen_random_uuid(),
+    phone           VARCHAR(20) UNIQUE,                   -- 手机号（加密存储）
+    openid          VARCHAR(128) UNIQUE,                  -- 微信 openid
+    union_id        VARCHAR(128),                         -- 微信 unionid（可选）
+    nickname        VARCHAR(50),                          -- 昵称
+    avatar_url      VARCHAR(500),                         -- 头像 URL
+    default_record_mode VARCHAR(20) DEFAULT 'ask',        -- ask/photo/manual
+    notification_enabled BOOLEAN DEFAULT false,           -- 是否开启提醒
+    notification_time TIME DEFAULT '15:00:00',            -- 提醒时间
+    created_at      TIMESTAMPTZ NOT NULL DEFAULT now(),
+    updated_at      TIMESTAMPTZ NOT NULL DEFAULT now(),
+    last_login_at   TIMESTAMPTZ,
+    is_deleted      BOOLEAN NOT NULL DEFAULT false
+);
+
+-- 索引
+CREATE INDEX idx_users_phone ON users(phone) WHERE NOT is_deleted;
+CREATE INDEX idx_users_openid ON users(openid) WHERE NOT is_deleted;
+```
+
+#### coffee_records（咖啡记录表）
+
+```sql
+CREATE TABLE coffee_records (
+    id              UUID PRIMARY KEY DEFAULT gen_random_uuid(),
+    user_id         UUID NOT NULL REFERENCES users(id),
+    shop_id         UUID REFERENCES shops(id),            -- 关联店铺（可为 null）
+    shop_name       VARCHAR(100),                         -- 店铺名称（冗余，自定义店铺时无 shop_id）
+    shop_brand      VARCHAR(50),                          -- 品牌名
+    coffee_category VARCHAR(30) NOT NULL,                 -- 品类枚举
+    bean_origin     VARCHAR(100),                         -- 豆子产区
+    roast_level     VARCHAR(20),                          -- 烘焙度枚举
+    process_method  VARCHAR(20),                          -- 处理法枚举
+    flavor_tags     TEXT[] DEFAULT '{}',                  -- 风味标签数组
+    rating          SMALLINT NOT NULL DEFAULT 3 CHECK (rating BETWEEN 1 AND 5),
+    price           DECIMAL(10,2),                        -- 价格（元）
+    review          VARCHAR(500),                         -- 文字感受
+    photo_urls      TEXT[] DEFAULT '{}',                  -- 原始照片 URL 数组（1-5 张）
+    card_image_url  VARCHAR(500),                         -- 卡通形象图 URL
+    card_thumbnail_url VARCHAR(500),                      -- 卡通缩略图 URL
+    card_source     VARCHAR(20),                          -- pre_generated/realtime/fallback
+    card_status     VARCHAR(20) NOT NULL DEFAULT 'pending', -- pending/matched/generating/generated/failed
+    record_date     TIMESTAMPTZ NOT NULL,                 -- 喝咖啡时间
+    sync_status     VARCHAR(20) DEFAULT 'synced',         -- synced/pending（离线同步用）
+    location_point  GEOGRAPHY(POINT, 4326),               -- GPS 坐标（PostGIS）
+    location_name   VARCHAR(200),                         -- 地点名称
+    created_at      TIMESTAMPTZ NOT NULL DEFAULT now(),
+    updated_at      TIMESTAMPTZ NOT NULL DEFAULT now(),
+    is_deleted      BOOLEAN NOT NULL DEFAULT false
+);
+
+-- 核心索引
+CREATE INDEX idx_records_user_id ON coffee_records(user_id) WHERE NOT is_deleted;
+CREATE INDEX idx_records_user_date ON coffee_records(user_id, record_date DESC) WHERE NOT is_deleted;
+CREATE INDEX idx_records_shop_id ON coffee_records(shop_id) WHERE shop_id IS NOT NULL AND NOT is_deleted;
+CREATE INDEX idx_records_category ON coffee_records(user_id, coffee_category) WHERE NOT is_deleted;
+CREATE INDEX idx_records_brand ON coffee_records(user_id, shop_brand) WHERE shop_brand IS NOT NULL AND NOT is_deleted;
+CREATE INDEX idx_records_card_status ON coffee_records(card_status) WHERE card_status IN ('pending', 'generating');
+CREATE INDEX idx_records_location ON coffee_records USING GIST(location_point);
+CREATE INDEX idx_records_record_date ON coffee_records(user_id, DATE(record_date)) WHERE NOT is_deleted;
+```
+
+#### shops（店铺表）
+
+```sql
+CREATE TABLE shops (
+    id              UUID PRIMARY KEY DEFAULT gen_random_uuid(),
+    brand           VARCHAR(50),                          -- 品牌名（连锁品牌）
+    name            VARCHAR(100) NOT NULL,                -- 门店名称
+    address         VARCHAR(300),                         -- 地址
+    city            VARCHAR(50),                          -- 城市
+    location_point  GEOGRAPHY(POINT, 4326),               -- GPS 坐标
+    phone           VARCHAR(20),                          -- 电话
+    source          VARCHAR(20) NOT NULL DEFAULT 'seed',  -- seed（种子数据）/ user_created（用户创建）
+    status          VARCHAR(20) NOT NULL DEFAULT 'active', -- active/pending_review/disabled
+    created_at      TIMESTAMPTZ NOT NULL DEFAULT now(),
+    updated_at      TIMESTAMPTZ NOT NULL DEFAULT now()
+);
+
+-- 索引
+CREATE INDEX idx_shops_brand ON shops(brand) WHERE brand IS NOT NULL;
+CREATE INDEX idx_shops_location ON shops USING GIST(location_point);
+CREATE INDEX idx_shops_city ON shops(city) WHERE city IS NOT NULL;
+CREATE INDEX idx_shops_status ON shops(status);
+```
+
+#### card_templates（预生成卡片库）
+
+```sql
+CREATE TABLE card_templates (
+    id              UUID PRIMARY KEY DEFAULT gen_random_uuid(),
+    brand           VARCHAR(50),                          -- 品牌名（null 表示通用）
+    coffee_category VARCHAR(30) NOT NULL,                 -- 品类枚举
+    image_url       VARCHAR(500) NOT NULL,                -- 卡通形象原图 URL
+    thumbnail_url   VARCHAR(500) NOT NULL,                -- 缩略图 URL
+    generate_type   VARCHAR(20) NOT NULL DEFAULT 'pre_batch', -- pre_batch（批量预生成）/ realtime（实时生成入库）
+    status          VARCHAR(20) NOT NULL DEFAULT 'active', -- active/disabled
+    hit_count       INTEGER DEFAULT 0,                    -- 命中次数统计
+    created_at      TIMESTAMPTZ NOT NULL DEFAULT now()
+);
+
+-- 唯一约束：brand + category 组合唯一
+CREATE UNIQUE INDEX idx_card_templates_brand_category 
+    ON card_templates(COALESCE(brand, '__generic__'), coffee_category) 
+    WHERE status = 'active';
+
+CREATE INDEX idx_card_templates_lookup 
+    ON card_templates(brand, coffee_category) WHERE status = 'active';
+```
+
+#### user_shops（用户常用店铺）
+
+```sql
+CREATE TABLE user_shops (
+    id              UUID PRIMARY KEY DEFAULT gen_random_uuid(),
+    user_id         UUID NOT NULL REFERENCES users(id),
+    shop_id         UUID NOT NULL REFERENCES shops(id),
+    record_count    INTEGER DEFAULT 1,                    -- 在该店铺的记录数
+    last_record_at  TIMESTAMPTZ,                          -- 最后一次记录时间
+    created_at      TIMESTAMPTZ NOT NULL DEFAULT now(),
+    updated_at      TIMESTAMPTZ NOT NULL DEFAULT now(),
+    
+    UNIQUE(user_id, shop_id)
+);
+
+CREATE INDEX idx_user_shops_user ON user_shops(user_id, record_count DESC);
+```
+
+### 5.3 索引策略说明
+
+| 查询场景 | 使用索引 | 说明 |
+|----------|----------|------|
+| 首页-今日卡片 | idx_records_user_date | WHERE user_id=? AND DATE(record_date)=today |
+| 卡片册-列表视图 | idx_records_user_date | 按时间倒序分页 |
+| 卡片册-日历视图 | idx_records_record_date | 按月聚合 |
+| 统计-品类排行 | idx_records_category | GROUP BY coffee_category |
+| 统计-店铺排行 | idx_records_shop_id | GROUP BY shop_id |
+| 统计-品牌排行 | idx_records_brand | GROUP BY shop_brand |
+| 卡片-待生成轮询 | idx_records_card_status | WHERE card_status IN ('pending','generating') |
+| 店铺-附近搜索 | idx_shops_location | PostGIS ST_DWithin 地理范围查询 |
+| 卡片模板-匹配 | idx_card_templates_lookup | WHERE brand=? AND coffee_category=? |
+
+### 5.4 枚举值管理
+
+枚举值在数据库中使用 VARCHAR 存储，在应用层通过 TypeScript 类型约束。好处是新增枚举值无需修改数据库 Schema，只需应用层同步更新。
+
+枚举定义统一维护在 `packages/shared-types/src/enums.ts`，前后端共用。
+
+### 5.5 软删除策略
+
+- `users` 和 `coffee_records` 表包含 `is_deleted` 字段，删除操作执行 `UPDATE ... SET is_deleted = true`
+- 所有查询默认附加 `WHERE is_deleted = false`（通过 TypeORM 的 `@DeleteDateColumn` 或全局 Scope 实现）
+- 用户注销时：硬删除用户关联的照片文件（MinIO），软删除用户记录，30 天后定时任务硬删除
+- `shops` 和 `card_templates` 使用 `status` 字段管理生命周期，不做软删除
+
+### 5.6 数据迁移与种子数据
+
+**Migration 管理**：
+- 使用 TypeORM Migration，存放在 `apps/api/src/database/migrations/`
+- 命令：`npm run db:migrate`（执行）、`npm run db:migrate:revert`（回滚）、`npm run db:migrate:generate`（自动生成）
+
+**种子数据脚本**（`npm run db:seed`）：
+
+1. **品牌店铺种子**：
+   - 8 个连锁品牌：星巴克、瑞幸、Manner、M Stand、%Arabica、Seesaw、Peet's Coffee、Tims
+   - 每个品牌导入主要城市门店数据（名称、地址、GPS 坐标），来源高德 POI 批量查询
+   - 约 500-1000 条门店记录
+
+2. **预生成卡片库种子**：
+   - 8 品牌 × 14 品类 = 112 张组合
+   - 每张调用通义万相 API 生成卡通形象图，上传至 MinIO，写入 `card_templates` 表
+   - 另生成 14 张通用品类图（brand 为 null，用于自定义店铺）
+   - 总计 126 张预生成卡片
+
+
+---
+
+## 六、API 详细设计
+
+### 6.1 统一响应格式
+
+所有接口统一返回以下 JSON 结构：
+
+```json
+{
+  "code": 0,
+  "msg": "success",
+  "data": { }
+}
+```
+
+- `code = 0`：成功
+- `code != 0`：失败，`msg` 包含错误描述
+- `data`：业务数据，失败时为 `null`
+
+### 6.2 错误码体系
+
+| 错误码范围 | 分类 | 说明 |
+|-----------|------|------|
+| 0 | 成功 | - |
+| 1000-1999 | 认证错误 | 1001 未登录 / 1002 Token 过期 / 1003 验证码错误 / 1004 验证码过期 / 1005 微信授权失败 |
+| 2000-2999 | 参数错误 | 2001 缺少必填参数 / 2002 参数格式错误 / 2003 枚举值无效 |
+| 3000-3999 | 业务错误 | 3001 记录不存在 / 3002 无权操作 / 3003 照片数量超限 / 3004 店铺不存在 |
+| 4000-4999 | AI 服务错误 | 4001 图片识别超时 / 4002 图片识别失败 / 4003 卡片生成超时 / 4004 卡片生成失败 |
+| 5000-5999 | 系统错误 | 5001 文件上传失败 / 5002 存储服务不可用 / 5003 限流 |
+| 9999 | 未知错误 | 兜底 |
+
+### 6.3 鉴权方式
+
+- 除公开接口外，所有 API 请求需携带 `Authorization: Bearer <accessToken>` Header
+- 公开接口：`POST /auth/*`、`GET /share/*`（H5 分享页数据）、`GET /health`
+- accessToken 过期时返回 `code: 1002`，客户端使用 refreshToken 调用 `POST /auth/refresh` 获取新 Token 对
+
+### 6.4 分页规范
+
+列表类接口采用 cursor-based 分页：
+
+```
+GET /records?cursor={last_id}&limit=20
+```
+
+响应：
+
+```json
+{
+  "code": 0,
+  "data": {
+    "items": [...],
+    "next_cursor": "record_uuid_last_item",
+    "has_more": true
+  }
+}
+```
+
+- `cursor`：上一页最后一条记录的 ID，首页请求不传
+- `limit`：每页条数，默认 20，最大 50
+- `next_cursor`：下一页游标，`has_more = false` 时为 `null`
+
+### 6.5 接口完整定义
+
+#### 认证模块
+
+**POST /api/v1/auth/wechat** — 微信登录
+
+```json
+// Request
+{ "code": "wx_auth_code_from_wx_login" }
+
+// Response
+{
+  "code": 0,
+  "data": {
+    "access_token": "jwt_access_token",
+    "refresh_token": "jwt_refresh_token",
+    "expires_in": 7200,
+    "is_new_user": true
+  }
+}
+```
+
+**POST /api/v1/auth/phone** — 手机号登录
+
+```json
+// Request
+{ "phone": "13800138000", "code": "123456" }
+
+// Response - 同微信登录
+```
+
+**POST /api/v1/auth/sms** — 发送验证码
+
+```json
+// Request
+{ "phone": "13800138000" }
+
+// Response
+{ "code": 0, "data": { "expire_in": 300 } }
+```
+
+限流：同一手机号 60 秒内只能发送 1 次，每日最多 10 次。
+
+**POST /api/v1/auth/refresh** — 刷新 Token
+
+```json
+// Request
+{ "refresh_token": "jwt_refresh_token" }
+
+// Response - 同微信登录
+```
+
+#### 记录模块
+
+**POST /api/v1/records** — 创建记录
+
+详见 PRD 5.2，此处补充多图字段：
+
+```json
+// Request
+{
+  "shop_id": "uuid_or_null",
+  "shop_name": "Manner · 静安寺店",
+  "shop_brand": "Manner",
+  "coffee_category": "latte",
+  "bean_origin": "埃塞俄比亚 耶加雪菲",
+  "roast_level": "medium_light",
+  "process_method": "washed",
+  "flavor_tags": ["citrus", "floral", "sweet"],
+  "rating": 4,
+  "price": 22.00,
+  "review": "清爽的花果香",
+  "photo_urls": [                          // 支持 1-5 张
+    "https://minio.xxx/photos/a.jpg",
+    "https://minio.xxx/photos/b.jpg"
+  ],
+  "latitude": 31.2235,
+  "longitude": 121.4532,
+  "location_name": "上海市静安区",
+  "record_date": "2026-07-09T14:30:00+08:00"
+}
+
+// Response
+{
+  "code": 0,
+  "data": {
+    "id": "record_uuid",
+    "card_status": "pending",
+    "created_at": "2026-07-09T14:31:00+08:00"
+  }
+}
+```
+
+创建记录后服务端自动触发卡片匹配（POST /cards/match），前端根据返回的 card_status 决定是否轮询。
+
+**PUT /api/v1/records/{id}** — 更新记录
+
+Request Body 同创建，所有字段可选（仅传需要修改的字段）。仅记录所有者可操作，否则返回 3002。
+
+**DELETE /api/v1/records/{id}** — 删除记录
+
+软删除，返回 `{ "code": 0, "data": null }`。仅记录所有者可操作。
+
+**GET /api/v1/records** — 记录列表
+
+```
+?cursor={id}&limit=20&shop_id={shop_uuid}&category={category}&start_date=2026-01-01&end_date=2026-12-31
+```
+
+所有筛选参数可选。响应格式见分页规范。
+
+**GET /api/v1/records/{id}** — 记录详情
+
+返回完整的 CoffeeRecord 对象。H5 分享页使用此接口，对非所有者隐藏 `phone` 等敏感字段。
+
+#### 上传模块
+
+**POST /api/v1/upload** — 上传照片
+
+```
+Content-Type: multipart/form-data
+Field: files (支持多文件，最多 5 个)
+```
+
+```json
+// Response
+{
+  "code": 0,
+  "data": {
+    "urls": [
+      "https://minio.xxx/photos/uuid1.jpg",
+      "https://minio.xxx/photos/uuid2.jpg"
+    ]
+  }
+}
+```
+
+限制：单文件 ≤ 10MB，仅允许 jpg/jpeg/png/heic，总文件数 ≤ 5。
+
+#### 店铺模块
+
+**GET /api/v1/shops/search** — 搜索店铺
+
+```
+?keyword=星巴克&city=上海&limit=20
+```
+
+```json
+// Response
+{
+  "code": 0,
+  "data": {
+    "items": [
+      { "id": "uuid", "brand": "星巴克", "name": "静安寺店", "address": "...", "distance": 1200 }
+    ]
+  }
+}
+```
+
+搜索逻辑：先查本地数据库（品牌名 + 门店名模糊匹配），结果为空时回退调用高德 POI 搜索。
+
+**GET /api/v1/shops/nearby** — 附近店铺
+
+```
+?latitude=31.2235&longitude=121.4532&radius=1000&limit=20
+```
+
+使用 PostGIS ST_DWithin 做地理范围查询。返回结构同搜索。
+
+**POST /api/v1/shops** — 创建自定义店铺
+
+```json
+// Request
+{
+  "brand": null,
+  "name": "老张咖啡",
+  "address": "上海市徐汇区...",
+  "latitude": 31.1,
+  "longitude": 121.4
+}
+
+// Response
+{ "code": 0, "data": { "id": "shop_uuid" } }
+```
+
+用户创建的店铺 status = 'active'，一期不做审核。
+
+#### 用户模块
+
+**GET /api/v1/users/profile** — 获取用户资料
+
+```json
+// Response
+{
+  "code": 0,
+  "data": {
+    "id": "user_uuid",
+    "nickname": "咖啡爱好者",
+    "avatar_url": "https://...",
+    "phone": "138****8000",
+    "default_record_mode": "ask",
+    "notification_enabled": false,
+    "notification_time": "15:00",
+    "created_at": "2026-01-01T00:00:00+08:00",
+    "total_records": 50,
+    "total_shops": 12
+  }
+}
+```
+
+**PUT /api/v1/users/profile** — 更新用户资料
+
+Request Body 所有字段可选：`nickname`、`avatar_url`、`default_record_mode`、`notification_enabled`、`notification_time`。
+
+**GET /api/v1/users/labels** — 咖啡身份标签
+
+```json
+// Response
+{
+  "code": 0,
+  "data": {
+    "labels": [
+      { "type": "total_records", "text": "已记录 50 杯", "icon": "coffee" },
+      { "type": "favorite_category", "text": "拿铁爱好者", "icon": "heart" },
+      { "type": "explorer", "text": "尝试过 8 种品类", "icon": "star" }
+    ]
+  }
+}
+```
+
+标签根据用户记录数据动态计算，规则：
+- total_records：杯数里程碑（10/50/100/500）
+- favorite_category：最高频品类（≥5 杯时展示）
+- explorer：尝试品类数（≥3 种时展示）
+- shop_hopper：去过店铺数（≥5 家时展示）
+
+#### 已在 PRD 中定义的接口
+
+以下接口已在 PRD 5.2 中完整定义，此处不重复：
+- `GET /api/v1/home/feed` — 首页聚合数据
+- `POST /api/v1/cards/match` — 匹配/生成卡片
+- `GET /api/v1/cards/{record_id}/status` — 卡片状态
+- `GET /api/v1/records/calendar` — 日历数据
+- `GET /api/v1/stats/overview` — 统计概览
+- `GET /api/v1/stats/ranking/category` — 品类排行
+- `GET /api/v1/stats/ranking/shop` — 店铺排行
+- `GET /api/v1/stats/ranking/brand` — 品牌排行
+- `GET /api/v1/stats/surprise` — 惊喜发现
+
+
+---
+
+## 七、AI 服务集成方案
+
+### 7.1 图片识别方案（阿里云 Qwen-VL）
+
+#### 调用规范
+
+使用阿里云 DashScope 平台的多模态对话接口，模型为 `qwen-vl-max` 或 `qwen-vl-plus`。
+
+**API 端点**：`https://dashscope.aliyuncs.com/api/v1/services/aigc/multimodal-generation/generation`
+
+**请求格式**（多图合并）：
+
+```json
+{
+  "model": "qwen-vl-max",
+  "input": {
+    "messages": [
+      {
+        "role": "user",
+        "content": [
+          { "image": "https://minio.xxx/photos/a.jpg" },
+          { "image": "https://minio.xxx/photos/b.jpg" },
+          { "image": "https://minio.xxx/photos/c.jpg" },
+          { "text": "请分析以上咖啡相关图片，提取以下信息并以 JSON 格式返回：\n1. coffee_category: 咖啡品类（从以下枚举中选择：americano/latte/cappuccino/flat_white/mocha/macchiato/dirty/pour_over/cold_brew/ice_drip/signature/instant/capsule/other）\n2. brand: 品牌名（如能从杯身Logo、门头识别）\n3. shop_name: 店铺名（如能从门头、菜单识别）\n4. bean_origin: 豆子产区（如能从菜单牌、豆袋标签识别）\n5. roast_level: 烘焙度（light/medium_light/medium/medium_dark/dark，如能识别）\n6. process_method: 处理法（natural/washed/honey/anaerobic/wet_hulled/other，如能识别）\n7. flavor_tags: 风味关键词数组（从菜单描述、豆袋风味标签提取）\n8. confidence: 整体置信度（0-1）\n\n如果某项无法从图片中识别，返回 null。" }
+        ]
+      }
+    ]
+  }
+}
+```
+
+#### 结构化输出解析
+
+Qwen-VL 返回文本后，后端解析流程：
+
+1. 提取 JSON 代码块（正则匹配 ````json ... ```` 或花括号包裹内容）
+2. JSON.parse 解析
+3. 校验枚举值合法性（如 coffee_category 不在枚举范围内，置为 null）
+4. 置信度 > 0.7 的字段自动预填，< 0.7 不预填
+
+#### 降级与重试策略
+
+| 场景 | 处理 |
+|------|------|
+| 超时（>8 秒） | 降级为仅发送第一张图片重新请求；若仍超时（>5 秒），返回空结果 |
+| API 返回错误 | 重试 1 次；二次失败返回空结果 |
+| 返回内容无法解析为 JSON | 尝试提取关键词（正则匹配品类名）；失败则返回空结果 |
+| 图片 URL 不可达 | 跳过该图片，用剩余图片请求 |
+| 全部图片不可达 | 返回空结果，前端提示手动填写 |
+
+### 7.2 卡通卡片生成方案
+
+#### 预生成库批量生成流程
+
+一期上线前需完成 126 张预生成卡片的批量生成：
+
+**生成计划**：
+
+| 批次 | 内容 | 数量 | 说明 |
+|------|------|------|------|
+| 批次 1 | 8 品牌 × 14 品类 | 112 张 | 如"Manner 拿铁""星巴克 美式" |
+| 批次 2 | 通用品类（brand=null）| 14 张 | 如"通用 拿铁""通用 手冲" |
+
+**生成流程**：
+
+```
+批量脚本                    通义万相 API              MinIO              PostgreSQL
+    │                          │                      │                    │
+    │  遍历 126 个组合          │                      │                    │
+    │  构造 Prompt             │                      │                    │
+    │─────────────────────────>│                      │                    │
+    │                          │  生成卡通形象图       │                    │
+    │<──── 图片 URL ────────────│                      │                    │
+    │                          │                      │                    │
+    │  下载图片 + 上传 MinIO    │                      │                    │
+    │─────────────────────────────────────────────────>│                    │
+    │<──── minio_url ─────────────────────────────────│                    │
+    │                          │                      │                    │
+    │  写入 card_templates 表   │                      │                    │
+    │──────────────────────────────────────────────────────────────────────>│
+```
+
+**Prompt 模板**：
+
+```
+请生成一张可爱的卡通风格咖啡形象图。
+咖啡品类：{coffee_category_label}
+品牌：{brand_name}（如有）
+风格：日系治愈风，暖色调，圆润线条，纯图像不含任何文字。
+形象要求：将咖啡杯拟人化，带有可爱表情，根据品类特征设计造型（如拿铁有奶泡、美式是黑色液体、手冲有滤杯）。
+背景：简洁纯色背景。
+尺寸：1024x1024
+```
+
+#### 实时生成异步流程
+
+当预生成库未命中时触发：
+
+1. **Card Service** 发布任务至 Redis Stream `card:generate:tasks`
+2. **Card Worker**（独立消费者）消费任务：
+   - 调用通义万相 API 生成图片
+   - 下载图片，上传 MinIO
+   - 更新 `coffee_records.card_image_url` 和 `card_status = 'generated'`
+   - 同时写入 `card_templates` 表（`generate_type = 'realtime'`），后续相同组合直接命中
+3. 前端通过 `GET /cards/{record_id}/status` 轮询结果
+
+**失败重试**：
+- Worker 消费失败后自动重试 1 次（Redis Streams 的 ACK 机制）
+- 二次失败将 `card_status` 设为 `failed`，前端展示 fallback 兜底图
+
+### 7.3 预生成卡片库管理
+
+**命中率监控**：
+- `card_templates.hit_count` 记录每张模板的命中次数
+- 定期统计命中率：`hit_rate = 命中次数 / 总请求次数`
+- 目标：一期上线后命中率 ≥ 90%（种子品牌覆盖主流场景）
+
+**扩展策略（二期）**：
+- 监控未命中（realtime 生成）的品牌+品类组合
+- 当某个组合 realtime 生成次数 ≥ 5 时，自动加入预生成库
+- 持续扩充品牌库和品类覆盖
+
+
+---
+
+## 八、缓存策略设计
+
+### 8.1 Redis Key 命名规范
+
+格式：`{业务域}:{资源类型}:{标识}:{维度}`
+
+示例：
+- `session:user:{userId}` — 用户会话
+- `home:today:{userId}:{date}` — 首页今日卡片
+- `home:feed:{userId}:{date}` — 首页 Feed 聚合缓存
+- `stats:{userId}:overview:{period}` — 统计概览
+- `stats:{userId}:ranking:{type}:{period}` — 排行数据
+- `stats:{userId}:surprise` — 惊喜发现
+- `card:match:{brand}:{category}` — 卡片模板匹配缓存
+- `shop:search:{keyword_hash}` — 店铺搜索缓存
+- `shop:nearby:{lat_rounded}:{lng_rounded}` — 附近店铺缓存
+- `sms:limit:{phone}` — 短信限流计数器
+
+### 8.2 各场景缓存策略
+
+| 场景 | Key | TTL | 更新策略 | 说明 |
+|------|-----|-----|----------|------|
+| 会话缓存 | `session:refresh:{userId}` | 30 天 | 刷新 Token 时更新 | 存储 refreshToken 的 JTI，用于撤销机制 |
+| 首页今日卡片 | `home:today:{userId}:{date}` | 5 分钟 | 创建记录后主动失效 | 创建记录时 DEL 此 Key |
+| 首页 Feed | `home:feed:{userId}:{date}` | 5 分钟 | 创建记录后主动失效 | 含场景文案+展位数据 |
+| 统计概览 | `stats:{userId}:overview:{period}` | 1 小时 | 创建/删除记录后主动失效 | period: history/year/month |
+| 品类排行 | `stats:{userId}:ranking:category:{period}` | 1 小时 | 同上 | - |
+| 店铺排行 | `stats:{userId}:ranking:shop:{period}` | 1 小时 | 同上 | - |
+| 品牌排行 | `stats:{userId}:ranking:brand:{period}` | 1 小时 | 同上 | - |
+| 惊喜发现 | `stats:{userId}:surprise` | 1 小时 | 创建记录后主动失效 | - |
+| 卡片模板匹配 | `card:match:{brand}:{category}` | 24 小时 | 新模板入库时写入 | 预生成库命中后缓存模板数据 |
+| 店铺搜索 | `shop:search:{keyword_hash}` | 10 分钟 | 自然过期 | keyword_hash 为关键词的 MD5 前 8 位 |
+| 附近店铺 | `shop:nearby:{lat}:{lng}` | 10 分钟 | 自然过期 | lat/lng 四舍五入到小数点后 2 位（约 1km 精度）|
+| 短信限流 | `sms:limit:{phone}` | 60 秒 / 24 小时 | 自增计数器 | 60 秒内限 1 次，24 小时内限 10 次 |
+
+### 8.3 缓存失效与更新策略
+
+**主动失效**：用户创建/更新/删除记录后，主动 DEL 与该用户相关的缓存 Key：
+- `home:today:{userId}:*`
+- `home:feed:{userId}:*`
+- `stats:{userId}:*`
+
+**缓存穿透防护**：
+- 对空结果也缓存（TTL 30 秒），防止恶意请求打穿数据库
+- 使用 Bloom Filter 对 record_id 做前置校验（二期，一期暂不实现）
+
+**缓存雪崩防护**：
+- TTL 加随机偏移（±10%），避免大量 Key 同时过期
+
+---
+
+## 九、安全设计
+
+### 9.1 认证鉴权流程
+
+```
+客户端                        NestJS API                   Redis
+  │                              │                          │
+  │  登录成功                     │                          │
+  │<──── accessToken(2h) + refreshToken(30d) ──────────────│
+  │                              │                          │
+  │  业务请求                     │                          │
+  │  Authorization: Bearer xxx   │                          │
+  │─────────────────────────────>│                          │
+  │                              │  验证 JWT 签名+有效期     │
+  │                              │  提取 userId             │
+  │                              │                          │
+  │  [accessToken 过期]          │                          │
+  │<──── 401 code:1002 ─────────│                          │
+  │                              │                          │
+  │  POST /auth/refresh          │                          │
+  │  {refreshToken}              │                          │
+  │─────────────────────────────>│  校验 refreshToken       │
+  │                              │─────────────────────────>│
+  │                              │  检查 JTI 是否已撤销      │
+  │                              │<──── 有效 ──────────────│
+  │                              │  签发新 Token 对          │
+  │                              │  旧 refreshToken 加入撤销列表
+  │<──── 新 accessToken + refreshToken ────────────────────│
+```
+
+### 9.2 接口权限模型
+
+- 基于 `@CurrentUser()` 装饰器获取当前用户 ID
+- 基于 `@OwnerGuard()` 守卫校验资源归属（record_id 对应的 user_id 是否等于当前用户）
+- 管理员接口（未来扩展）预留 `@Roles('admin')` 装饰器
+
+权限矩阵：
+
+| 操作 | 权限 |
+|------|------|
+| 创建记录 | 登录用户 |
+| 查看/更新/删除自己的记录 | 登录用户 + 资源所有者 |
+| 查看他人记录（H5 分享页）| 公开（脱敏） |
+| 创建自定义店铺 | 登录用户 |
+| 查看/更新个人资料 | 登录用户 + 资源所有者 |
+
+### 9.3 敏感数据处理
+
+| 数据类型 | 处理方式 |
+|----------|----------|
+| 手机号 | AES-256 加密存储，展示时脱敏（138****8000）|
+| GPS 坐标 | 仅用于店铺匹配和记录关联，不保存历史轨迹，记录中存储精度为小数点后 4 位（约 10m）|
+| 微信 openid | 加密存储，不对外暴露 |
+| JWT Secret | 环境变量注入，不入代码仓库 |
+| AI API Key | 环境变量注入，不入代码仓库 |
+
+### 9.4 文件上传安全
+
+- **类型校验**：服务端校验文件 MIME 类型（仅允许 image/jpeg、image/png、image/heic），不仅依赖 Content-Type Header，还需读取文件头魔数
+- **大小限制**：单文件 ≤ 10MB，总文件数 ≤ 5
+- **文件名处理**：上传后重命名为 UUID，不保留原始文件名
+- **存储隔离**：用户照片存储于 MinIO `photos` Bucket（私有访问），卡通卡片存储于 `cards` Bucket（公开访问 + CDN）
+- **预签名 URL**：客户端上传通过 MinIO 预签名 URL（有效期 15 分钟），避免通过后端中转大文件
+
+### 9.5 API 限流策略
+
+使用 NestJS `@nestjs/throttler` 模块，基于 Redis 实现分布式限流：
+
+| 接口类别 | 限流规则 | 说明 |
+|----------|----------|------|
+| 认证接口（/auth/*） | 10 次/分钟/IP | 防暴力破解 |
+| 短信接口（/auth/sms） | 1 次/60 秒/手机号，10 次/天/手机号 | 防短信轰炸 |
+| 文件上传（/upload） | 20 次/分钟/用户 | 防恶意上传 |
+| AI 相关（/cards/match） | 30 次/分钟/用户 | 控制 AI API 调用成本 |
+| 通用接口 | 120 次/分钟/用户 | 默认限流 |
+
+超限返回 HTTP 429 + `code: 5003`。
+
+### 9.6 AI 服务调用安全
+
+- **API Key 管理**：通过环境变量注入，生产环境使用密钥管理服务（如阿里云 KMS），不硬编码
+- **调用量监控**：记录每次 AI API 调用（模型、耗时、Token 数、结果状态），用于成本分析和异常检测
+- **预算告警**：设置每日调用量上限和费用阈值，超限自动告警（一期手动监控，二期自动化）
+- **Mock 模式**：开发/测试环境通过 `AI_MOCK=true` 环境变量启用 Mock，避免误消耗 API 配额
+
+
+---
+
+## 十、部署与运维
+
+### 10.1 容器化部署方案
+
+所有服务通过 Docker Compose 编排，`docker-compose.yml` 包含以下服务：
+
+```yaml
+version: '3.8'
+
+services:
+  # 反向代理
+  nginx:
+    image: nginx:1.25-alpine
+    ports: ["80:80", "443:443"]
+    volumes:
+      - ./nginx/nginx.conf:/etc/nginx/nginx.conf
+      - ./nginx/ssl:/etc/nginx/ssl
+    depends_on: [api, h5]
+
+  # 后端 API
+  api:
+    build: ./apps/api
+    environment:
+      - DATABASE_URL=postgresql://...
+      - REDIS_URL=redis://redis:6379
+      - MINIO_ENDPOINT=minio:9000
+      - AI_MOCK=false
+    depends_on: [postgres, redis, minio]
+
+  # H5 Web
+  h5:
+    build: ./apps/h5
+    environment:
+      - NEXT_PUBLIC_API_URL=/api
+    depends_on: [api]
+
+  # PostgreSQL
+  postgres:
+    image: postgis/postgis:16-3.4
+    volumes:
+      - pgdata:/var/lib/postgresql/data
+    environment:
+      - POSTGRES_DB=coffeenote
+      - POSTGRES_USER=app
+      - POSTGRES_PASSWORD=${DB_PASSWORD}
+
+  # Redis
+  redis:
+    image: redis:7-alpine
+    volumes:
+      - redisdata:/data
+    command: redis-server --appendonly yes
+
+  # MinIO
+  minio:
+    image: minio/minio:latest
+    volumes:
+      - miniodata:/data
+    command: server /data --console-address ":9001"
+    environment:
+      - MINIO_ROOT_USER=${MINIO_USER}
+      - MINIO_ROOT_PASSWORD=${MINIO_PASSWORD}
+
+volumes:
+  pgdata:
+  redisdata:
+  miniodata:
+```
+
+### 10.2 本地开发环境
+
+开发环境使用独立的 `docker-compose.dev.yml`，与生产配置的区别：
+
+| 配置项 | dev | production |
+|--------|-----|-----------|
+| 数据库密码 | 固定开发密码 | 环境变量注入 |
+| MinIO | 开放 9001 控制台端口 | 关闭控制台 |
+| Nginx | 不需要（直连端口） | 必须（SSL + 路由）|
+| AI Mock | `AI_MOCK=true` | `AI_MOCK=false` |
+| API 热重载 | `npm run start:dev` | `npm run start:prod` |
+| H5 热重载 | `npm run dev` | `npm run build && npm run start` |
+
+### 10.3 CI/CD 流水线
+
+```
+代码推送                CI 阶段                    CD 阶段
+  │                      │                          │
+  │  git push            │                          │
+  │─────────────────────>│                          │
+  │                      │  1. Lint + Type Check    │
+  │                      │  2. 单元测试              │
+  │                      │  3. 构建 Docker 镜像      │
+  │                      │  4. 推送镜像仓库          │
+  │                      │─────────────────────────>│
+  │                      │                          │  5. 部署到 staging
+  │                      │                          │  6. 自动化 E2E 测试
+  │                      │                          │  7. 手动审批
+  │                      │                          │  8. 部署到 production
+```
+
+**CI 工具**：GitHub Actions（或 GitLab CI），配置文件位于 `.github/workflows/`
+
+**分支策略**：
+- `main`：生产分支，合并后自动部署到 production
+- `develop`：开发分支，合并后自动部署到 staging
+- `feature/*`：功能分支，仅跑 CI
+
+### 10.4 监控与告警
+
+| 层级 | 监控内容 | 工具 | 告警条件 |
+|------|----------|------|----------|
+| 应用层 | API 响应时间、错误率、QPS | NestJS Logger + Prometheus | P99 > 3s 或 5xx > 1% |
+| 应用层 | AI API 调用耗时、成功率 | 自定义 Metrics | 成功率 < 90% |
+| 基础设施 | CPU/内存/磁盘 | Prometheus + Grafana | CPU > 80% 持续 5min |
+| 基础设施 | PostgreSQL 连接数、慢查询 | pg_stat_statements | 连接数 > 80 |
+| 基础设施 | Redis 内存使用、命中率 | Redis INFO | 内存 > 80% |
+| 基础设施 | MinIO 存储空间 | MinIO Metrics | 存储 > 80% |
+| AI 服务 | 阿里云 API 调用量、费用 | 阿里云控制台 | 日调用量超预算 |
+
+### 10.5 日志规范
+
+**结构化日志格式**（JSON）：
+
+```json
+{
+  "timestamp": "2026-07-09T14:30:00.000Z",
+  "level": "info",
+  "module": "RecordService",
+  "action": "create_record",
+  "userId": "uuid",
+  "recordId": "uuid",
+  "duration_ms": 230,
+  "requestId": "req-uuid"
+}
+```
+
+**链路追踪**：每个请求分配唯一 `requestId`（NestJS Interceptor 注入），贯穿整个调用链。
+
+**日志级别**：
+- `error`：异常（AI 服务调用失败、数据库错误）
+- `warn`：降级事件（AI 超时降级、缓存未命中）
+- `info`：关键业务操作（创建记录、卡片生成、登录）
+- `debug`：详细调试信息（仅 dev 环境）
+
+### 10.6 数据备份策略
+
+| 数据 | 备份方式 | 频率 | 保留策略 |
+|------|----------|------|----------|
+| PostgreSQL | pg_dump 全量备份 | 每日凌晨 | 保留 30 天 |
+| MinIO（照片） | MinIO 镜像复制 | 每日增量 | 保留 90 天 |
+| MinIO（卡片） | 无需备份 | - | 可从 card_templates 重新生成 |
+| Redis | RDB + AOF | 自动 | 保留 7 天 |
+
+备份文件存储于独立的备份存储卷或远程 S3 Bucket。
+
+---
+
+## 十一、第三方依赖清单
+
+### 11.1 开源组件
+
+| 组件 | 版本 | 用途 | 许可证 |
+|------|------|------|--------|
+| Flutter | 3.x | 移动端跨平台框架 | BSD |
+| Next.js | 14.x | H5 Web 框架 | MIT |
+| NestJS | 10.x | 后端 API 框架 | MIT |
+| PostgreSQL | 16.x | 主数据库 | PostgreSQL License |
+| PostGIS | 3.4.x | 地理空间扩展 | GPLv2 |
+| Redis | 7.x | 缓存 + 消息队列 | BSD (≤7.4) / RSALv2 (≥7.4) |
+| MinIO | 最新稳定版 | 对象存储 | AGPLv3 |
+| TypeORM | 0.3.x | ORM 框架 | MIT |
+| Docker | 24.x | 容器运行时 | Apache 2.0 |
+| Docker Compose | v2.x | 容器编排 | Apache 2.0 |
+| Nginx | 1.25.x | 反向代理 | BSD |
+
+> 注意：Redis 7.4+ 许可证变更为 RSALv2，商业使用需评估。可选替代：Valkey（Linux Foundation 分叉版，BSD 许可）。
+
+### 11.2 云服务
+
+| 服务 | 提供商 | 用途 | 计费模式 | 一期预估月成本 |
+|------|--------|------|----------|---------------|
+| Qwen-VL API | 阿里云 DashScope | 多图片识别 | 按 Token 计费 | ¥200-500（1000 DAU）|
+| 通义万相 / 即梦 | 阿里云 / 字节 | 卡通卡片生成 | 按张计费 | ¥300-800（1000 DAU）|
+| 高德 API | 高德开放平台 | POI/地理编码/周边搜索 | 免费额度 + 超额计费 | ¥0（免费额度内）|
+| 短信服务 | 阿里云/腾讯云 | 验证码 | 按条计费 | ¥50-100 |
+
+### 11.3 平台依赖
+
+| 平台 | 用途 | 申请要求 |
+|------|------|----------|
+| 微信开放平台 | 微信登录 + 分享 | 企业资质 + 应用审核 |
+| Apple Developer | iOS App 发布 | $99/年 |
+| Google Play Console | Android App 发布 | $25 一次性 |
+
